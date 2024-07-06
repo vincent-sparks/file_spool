@@ -1,42 +1,77 @@
 #![feature(seek_stream_len)]
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write}; use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::thread::Thread;
 
-use ringbuf::{storage::Array, traits::{Consumer as _, RingBuffer as _}, LocalRb};
 //use crossbeam_utils::atomic::AtomicCell;
 
 const RINGBUF_LEN: usize = 5;
-type Ringbuf<T> = LocalRb<Array<(u64, T), RINGBUF_LEN>>;
 
-// Unfortunately we cannot use the ringbuf crate's lock free features because they do not allow for
-// overwrites (as those require changing both cursors at once).
-
-//type RbProducer<T> = CachingProd<Arc<Ringbuf<T>>>;
-//type RbConsumer<T> = CachingCons<Arc<Ringbuf<T>>>;
-
-pub mod cloneable;
+struct RingBuf<T> {
+    ring: Box<[Mutex<Option<T>>]>,
+}
 
 enum State {
     Downloading,
     Done(Option<std::io::Error>),
 }
 
-struct Shared<T> {
-    state: State,
-    ringbuf: Ringbuf<T>,
-    total_length: Option<u64>,
+struct Shared {
+    total_length: AtomicU64,
+    waiters: Mutex<Vec<Thread>>,
+}
+
+struct RingBufferWriter<T> {
+    buffer: Box<[Mutex<T>]>,
+    write_position: AtomicUsize,
+}
+
+impl Shared {
+    fn get(&self) -> u64 {
+        loop {
+            let len = self.total_length.load(Ordering::Relaxed);
+            if len != 0 {
+                return len;
+            }
+            let mut guard = self.waiters.lock().unwrap();
+            // check again, now that we're holding the lock, just in case the sender thread
+            // happened to place the value just after we checked, so as to avoid putting ourselves
+            // in the queue to be woken up *after* the sender thread has woken everybody up.
+            let len = self.total_length.load(Ordering::Relaxed);
+            if len != 0 {
+                return len;
+            }
+            guard.push(std::thread::current());
+            std::mem::drop(guard);
+            std::thread::park();
+        }
+    }
+
+    fn try_get(&self) -> Option<u64> {
+        NonZeroU64::new(self.total_length.load(Ordering::Relaxed))
+    }
+
+    fn set(&self, len: u64) {
+        self.total_length.store(len, Ordering::Relaxed);
+        let mut guard = self.waiters.lock().unwrap();
+        for thread in std::mem::take(&mut *guard) {
+            thread.unpark();
+        }
+
+        std::mem::drop(guard);
+    }
 }
 
 pub struct Writer<T: AsRef<[u8]>, File: Write> {
     file: File,
-    shared: Arc<Mutex<Shared<T>>>,
-    condvar: Arc<Condvar>,
+    shared: Arc<Shared>,
+    bus: Bus<Result<T, String>>,
     position: u64,
 }
 
 pub struct Reader<T: AsRef<[u8]>, File: Read + Seek> {
     file: File,
-    shared: Arc<Mutex<Shared<T>>>,
+    reader: BusReader<Result<T, String>>,
     position: u64,
     condvar: Arc<Condvar>,
 }
