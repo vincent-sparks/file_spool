@@ -1,13 +1,9 @@
 #![feature(seek_stream_len)]
 #![feature(new_uninit)]
 use std::io::{Read, Seek, SeekFrom, Write}; use std::ops::ControlFlow;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::thread::Thread;
 
 //use crossbeam_utils::atomic::AtomicCell;
-
-const RINGBUF_LEN: usize = 5;
 
 struct RingBuf<T> {
     ring: Arc<Box<[Mutex<Option<T>>]>>,
@@ -16,6 +12,12 @@ struct RingBuf<T> {
 
 struct RingBufReader<T> {
     ring: Arc<Box<[Mutex<Option<T>>]>>,
+}
+
+impl<T> Clone for RingBufReader<T> {
+    fn clone(&self)->Self {
+        RingBufReader {ring: self.ring.clone()}
+    }
 }
 
 impl<T> RingBuf<T> {
@@ -65,11 +67,13 @@ impl<T> RingBufReader<T> {
     }
 }
 
+// TODO cloneable I/O errors
 #[derive(Default)]
 enum State {
     #[default]
     Downloading,
-    Done(Option<std::io::Error>),
+    Success,
+    Error(Option<std::io::Error>),
 }
 
 #[derive(Default)]
@@ -78,9 +82,8 @@ struct Shared {
     state: State,
 }
 
-pub struct Writer<T: AsRef<[u8]>, WriteFile: Write, ReadFile: Read+Seek, CreateReadFile: Fn() -> ReadFile> {
+pub struct Writer<T: AsRef<[u8]>, WriteFile: Write> {
     file: WriteFile,
-    create_reader: CreateReadFile,
     shared: Arc<Mutex<Shared>>,
     ringbuf: RingBuf<(u64, T)>,
     position: u64,
@@ -95,11 +98,17 @@ pub struct Reader<T: AsRef<[u8]>, File: Read + Seek> {
     condvar: Arc<Condvar>,
 }
 
-impl<T: AsRef<[u8]>, WriteFile: Write, ReadFile: Read+Seek, CreateReadFile: Fn()->ReadFile> Writer<T, WriteFile, ReadFile, CreateReadFile> {
-    pub fn new(ringbuf_len: usize, write_file: WriteFile, create_reader: CreateReadFile, initial_write_pos: u64) -> Self {
+pub struct ReaderCreator<T: AsRef<[u8]>, CreateReadFile> {
+    create_read_file: CreateReadFile,
+    ringbuf: RingBufReader<(u64, T)>,
+    shared: Arc<Mutex<Shared>>,
+    condvar: Arc<Condvar>,
+}
+
+impl<T: AsRef<[u8]>, WriteFile: Write> Writer<T, WriteFile> {
+    pub fn new(ringbuf_len: usize, write_file: WriteFile, initial_write_pos: u64) -> Self {
         Self {
             file: write_file,
-            create_reader,
             ringbuf: RingBuf::new(ringbuf_len),
             position: initial_write_pos,
             condvar: Default::default(),
@@ -116,8 +125,13 @@ impl<T: AsRef<[u8]>, WriteFile: Write, ReadFile: Read+Seek, CreateReadFile: Fn()
         Ok(())
     }
 
-    pub fn notify_eof(&self, error: Option<std::io::Error>) {
-        self.shared.lock().unwrap().state = State::Done(error);
+    pub fn notify_eof(&self) {
+        self.shared.lock().unwrap().state = State::Success;
+        self.condvar.notify_all();
+    }
+
+    pub fn notify_error(&self, error: std::io::Error) {
+        self.shared.lock().unwrap().state = State::Error(Some(error));
         self.condvar.notify_all();
     }
 
@@ -130,12 +144,45 @@ impl<T: AsRef<[u8]>, WriteFile: Write, ReadFile: Read+Seek, CreateReadFile: Fn()
         self.position
     }
 
-    pub fn create_reader(&self) -> Reader<T, ReadFile> {
+    pub fn create_reader<R: Read+Seek>(&self, file: R) -> Reader<T, R> {
         Reader {
-            file: (self.create_reader)(),
+            file,
             condvar: self.condvar.clone(),
             position: 0,
             ringbuf: self.ringbuf.new_reader(),
+            shared: self.shared.clone()
+        }
+    }
+
+    pub fn create_reader_creator<C>(&self, reader_creator: C) -> ReaderCreator<T, C> {
+        ReaderCreator {
+            create_read_file: reader_creator,
+            condvar: self.condvar.clone(),
+            ringbuf: self.ringbuf.new_reader(),
+            shared: self.shared.clone()
+        }
+    }
+}
+
+impl<T: AsRef<[u8]>, File: Read + Seek, CreateFile: FnMut() -> File> ReaderCreator<T, CreateFile>  {
+    pub fn create_reader_mut(&mut self) -> Reader<T, File> {
+        Reader {
+            file: (self.create_read_file)(),
+            condvar: self.condvar.clone(),
+            position: 0,
+            ringbuf: self.ringbuf.clone(),
+            shared: self.shared.clone()
+        }
+    }
+}
+
+impl<T: AsRef<[u8]>, File: Read + Seek, CreateFile: Fn() -> File> ReaderCreator<T, CreateFile>  {
+    pub fn create_reader(&self) -> Reader<T, File> {
+        Reader {
+            file: (self.create_read_file)(),
+            condvar: self.condvar.clone(),
+            position: 0,
+            ringbuf: self.ringbuf.clone(),
             shared: self.shared.clone()
         }
     }
@@ -179,14 +226,14 @@ impl<T: AsRef<[u8]>, File: Read + Seek> std::io::Read for Reader<T, File> {
             }
             let res = self.file.seek(SeekFrom::Start(self.position)).and_then(|_| self.file.read(&mut out_buf));
             if let Ok(0) = res {
-                if let State::Done(res) = &mut mutex.state {
-                    return match res.take() {
-                        None => Ok(0),
-                        Some(e) => Err(e),
-                    };
-                } 
-                mutex = self.condvar.wait(mutex).unwrap();
-                continue;
+                match &mut mutex.state {
+                    State::Success => return Ok(0),
+                    State::Error(e) => return Err(e.take().unwrap_or_else(|| std::io::Error::other("error message has already been consumed, no idea what it was"))),
+                    State::Downloading => {
+                        mutex = self.condvar.wait(mutex).unwrap();
+                        continue;
+                    },
+                }
             }
             if let Ok(count) = res {
                 self.position += count as u64;
@@ -216,15 +263,18 @@ impl<T: AsRef<[u8]>, File: Read+Seek> Seek for Reader<T, File> {
                             .ok_or_else(|| std::io::Error::other(format!("Attempt to seek with overflow (position was {}, offset was {})", self.position, offset)))?;
                         return Ok(self.position);
                     }
-                    if let State::Done(error) = &mut guard.state {
-                        if let Some(e) = error.take() {
-                            return Err(e);
-                        }
-                        // XXX can we trust the end position of the file here?
-                        self.position = self.file.seek(pos)?;
-                        return Ok(self.position);
+                    match &mut guard.state {
+                        State::Downloading => {
+                            guard = self.condvar.wait(guard).unwrap();
+                            continue;
+                        },
+                        State::Success => {
+                            return Ok(self.position);
+                        },
+                        State::Error(e) => {
+                            return Err(e.take().unwrap_or_else(|| std::io::Error::other("someone else already took the error :/")));
+                        },
                     }
-                    guard = self.condvar.wait(guard).unwrap();
                 }
             }
         }
@@ -241,13 +291,18 @@ impl<T: AsRef<[u8]>, File: Read+Seek> Seek for Reader<T, File> {
             if let Some(len) = mutex.total_length {
                 return Ok(len);
             }
-            if let State::Done(e) = &mut mutex.state {
-                match e.take() {
-                    Some(e) => return Err(e),
-                    None => return self.file.stream_len()
-                }
+            match &mut mutex.state {
+                State::Downloading => {
+                    mutex = self.condvar.wait(mutex).unwrap();
+                    continue;
+                },
+                State::Success => {
+                    return self.file.stream_len();
+                },
+                State::Error(e) => {
+                    return Err(e.take().unwrap_or_else(|| std::io::Error::other("someone else already took the error :/")));
+                },
             }
-            mutex = self.condvar.wait(mutex).unwrap();
         }
     }
 }
@@ -315,7 +370,7 @@ mod test {
         {
             let mut shared = reader.shared.lock().unwrap();
             ringbuf.write((27,[1,2,3,4,5].as_slice()));
-            shared.state=State::Done(None);
+            shared.state=State::Success;
         }
         assert_eq!(reader.read(&mut buf).unwrap(), 5);
         assert_eq!(buf[..5], [1,2,3,4,5]);
@@ -387,20 +442,17 @@ mod test {
 
         let backing_store = Arc::new(Mutex::new(Vec::new()));
 
-        let backing_reader = {
-            let backing_store = backing_store.clone();
-            move || ReadWrapper{
-                data: backing_store.clone(),
-                position: 0,
-                read_call_count: 0,
-                eof: Arc::new(AtomicBool::new(false)),
-            }
+        let backing_reader = ReadWrapper {
+            data: backing_store.clone(),
+            position: 0,
+            read_call_count: 0,
+            eof: Arc::new(AtomicBool::new(false)),
         };
 
         let backing_writer = WriteWrapper(backing_store);
 
-        let mut writer = Writer::new(5, backing_writer, backing_reader, 0);
-        let mut reader = writer.create_reader();
+        let mut writer = Writer::new(5, backing_writer, 0);
+        let mut reader = writer.create_reader(backing_reader);
 
         writer.write(&[1,2,3,4,5]).unwrap();
         writer.write(&[6,7,8,9,10]).unwrap();
@@ -425,7 +477,7 @@ mod test {
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(1));
             eof.store(true, Ordering::Relaxed);
-            writer.notify_eof(None);
+            writer.notify_eof();
         });
 
         assert!(reader.seek(std::io::SeekFrom::End(-10)).is_ok());
