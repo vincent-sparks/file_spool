@@ -192,6 +192,15 @@ impl<T: AsRef<[u8]>, File: Read + Seek> Reader<T, File> {
     pub fn get_total_length(&self) -> Option<u64> {
         self.shared.lock().unwrap().total_length
     }
+
+    pub fn new_already_completed(file: File) -> Self {
+        Self {
+            file,
+            ringbuf: RingBuf::new(0).new_reader(),
+            position: 0, shared: Arc::new(Mutex::new(Shared{state: State::Success, total_length: None})),
+            condvar: Default::default()
+        }
+    }
 }
 
 impl<T: AsRef<[u8]>, File: Read + Seek> std::io::Read for Reader<T, File> {
@@ -269,6 +278,7 @@ impl<T: AsRef<[u8]>, File: Read+Seek> Seek for Reader<T, File> {
                             continue;
                         },
                         State::Success => {
+                            self.position = self.file.seek(pos)?;
                             return Ok(self.position);
                         },
                         State::Error(e) => {
@@ -485,5 +495,22 @@ mod test {
         assert_eq!(reader.read(&mut buf).unwrap(), 10);
         //assert_eq!(reader.file.read_call_count, 2);
         assert_eq!(buf[..10], [26,27,28,29,30,31,32,33,34,35]);
+    }
+
+    #[test]
+    fn test_already_completed() {
+        use std::io::Cursor;
+        let backing_reader = Cursor::new(b"1234567890");
+        let mut f = Reader::<[u8;0], _>::new_already_completed(backing_reader);
+
+        let mut buf = [0u8;4];
+        assert_eq!(f.read(&mut buf).unwrap(), 4);
+        assert_eq!(&buf, b"1234");
+        
+        assert_eq!(f.seek(SeekFrom::End(-3)).unwrap(), 7);
+        assert_eq!(f.read(&mut buf).unwrap(), 3);
+        assert_eq!(&buf[..3], b"890");
+
+
     }
 }
